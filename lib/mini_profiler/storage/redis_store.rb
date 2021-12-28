@@ -213,7 +213,7 @@ unviewed_ids: #{get_unviewed_ids(user)}
         LUA
         groups.each.with_index do |(_, hash), index|
           best, count = meta_data[index]
-          hash[:best_score] = best
+          hash[:best_score] = best&.to_f
           hash[:snapshots_count] = count
         end
         groups
@@ -223,62 +223,25 @@ unviewed_ids: #{get_unviewed_ids(user)}
         group_hash_key = group_snapshot_hash_key(group_name)
         snapshots = []
         corrupt_snapshots = []
-        redis.hmgetall(group_hash_key).each do |id, bytes|
+        redis.hgetall(group_hash_key).each do |id, bytes|
           snapshots << Marshal.load(bytes)
         rescue
           corrupt_snapshots << id
         end
         if corrupt_snapshots.size > 0
-          redis.eval(<<~LUA)
-            
-          LUA
+          cleanup_corrupt_snapshots(corrupt_snapshots, group_name)
         end
+        snapshots
       end
 
-      def fetch_snapshots(batch_size: 200, &blk)
-        zset_key = snapshot_zset_key()
-        hash_key = snapshot_hash_key()
-        iteration = 0
-        corrupt_snapshots = []
-        while true
-          ids = redis.zrange(
-            zset_key,
-            batch_size * iteration,
-            batch_size * iteration + batch_size - 1
-          )
-          break if ids.size == 0
-          batch = redis.mapped_hmget(hash_key, *ids).to_a
-          batch.map! do |id, bytes|
-            begin
-              Marshal.load(bytes)
-            rescue
-              corrupt_snapshots << id
-              nil
-            end
-          end
-          batch.compact!
-          blk.call(batch) if batch.size != 0
-          break if ids.size < batch_size
-          iteration += 1
-        end
-        if corrupt_snapshots.size > 0
-          redis.pipelined do
-            redis.zrem(zset_key, corrupt_snapshots)
-            redis.hdel(hash_key, corrupt_snapshots)
-          end
-        end
-      end
-
-      def load_snapshot(id)
-        hash_key = snapshot_hash_key()
-        bytes = redis.hget(hash_key, id)
+      def load_snapshot(id, group_name)
+        group_hash_key = group_snapshot_hash_key(group_name)
+        bytes = redis.hget(group_hash_key, id)
+        return if !bytes
         begin
           Marshal.load(bytes)
         rescue
-          redis.pipelined do
-            redis.zrem(snapshot_zset_key(), id)
-            redis.hdel(hash_key, id)
-          end
+          cleanup_corrupt_snapshots([id], group_name)
           nil
         end
       end
@@ -304,24 +267,16 @@ unviewed_ids: #{get_unviewed_ids(user)}
         @snapshot_counter_key ||= "#{@prefix}-mini-profiler-snapshots-counter"
       end
 
-      def snapshot_zset_key
-        @snapshot_zset_key ||= "#{@prefix}-mini-profiler-snapshots-zset"
-      end
-
-      def snapshot_hash_key
-        @snapshot_hash_key ||= "#{@prefix}-mini-profiler-snapshots-hash"
-      end
-
       def group_snapshot_zset_key(group_name)
-        @group_snapshot_zset_key ||= "#{@prefix}-mp-group-snapshot-zset-key-#{group_name}"
+        "#{@prefix}-mp-group-snapshot-zset-key-#{group_name}"
       end
 
       def group_snapshot_hash_key(group_name)
-        @group_snapshot_hash_key ||= "#{@prefix}-mp-group-snapshot-hash-key-#{group_name}"
+        "#{@prefix}-mp-group-snapshot-hash-key-#{group_name}"
       end
 
       def snapshot_overview_zset_key
-        @snapshot_overview_zset_key ||= "#{@prefix}-mp-overviewgroup-snapshot-zset-key"
+        "#{@prefix}-mp-overviewgroup-snapshot-zset-key"
       end
 
       def cached_redis_eval(script, script_sha, reraise: true, argv: [], keys: [])
@@ -336,12 +291,43 @@ unviewed_ids: #{get_unviewed_ids(user)}
         end
       end
 
+      def cleanup_corrupt_snapshots(corrupt_snapshots_ids, group_name)
+        group_hash_key = group_snapshot_hash_key(group_name)
+        group_zset_key = group_snapshot_zset_key(group_name)
+        overview_zset_key = snapshot_overview_zset_key
+        lua = <<~LUA
+          local group_hash_key = KEYS[1]
+          local group_zset_key = KEYS[2]
+          local overview_zset_key = KEYS[3]
+          local group_name = ARGV[1]
+          for i, k in ipairs(ARGV) do
+            if k ~= group_name then
+              redis.call("HDEL", group_hash_key, k)
+              redis.call("ZREM", group_zset_key, k)
+            end
+          end
+          if redis.call("ZCARD", group_zset_key) == 0 then
+            redis.call("ZREM", overview_zset_key, group_name)
+            redis.call("DEL", group_hash_key, group_zset_key)
+          else
+            local worst_score = tonumber(redis.call("ZRANGE", group_zset_key, -1, -1, "WITHSCORES")[2])
+            redis.call("ZADD", overview_zset_key, worst_score, group_name)
+          end
+        LUA
+        redis.eval(
+          lua,
+          keys: [group_hash_key, group_zset_key, overview_zset_key],
+          argv: [group_name, *corrupt_snapshots_ids]
+        )
+      end
+
       # only used in tests
       def wipe_snapshots_data
+        keys = redis.keys(group_snapshot_hash_key('*'))
+        keys += redis.keys(group_snapshot_zset_key('*'))
         redis.pipelined do
-          redis.del(snapshot_counter_key())
-          redis.del(snapshot_zset_key())
-          redis.del(snapshot_hash_key())
+          redis.del(keys)
+          redis.del(snapshot_overview_zset_key)
         end
       end
     end
