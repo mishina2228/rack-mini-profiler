@@ -196,6 +196,43 @@ unviewed_ids: #{get_unviewed_ids(user)}
       end
 
       def fetch_snapshots_overview
+        overview_zset_key = snapshot_overview_zset_key
+        groups = redis
+          .zrange(overview_zset_key, 0, -1, withscores: true)
+          .map { |(name, worst_score)| [name, { worst_score: worst_score }] }
+
+        prefixed_group_names = groups.map { |g| group_snapshot_zset_key(g.first) }
+        meta_data = redis.eval(<<~LUA, keys: prefixed_group_names)
+          local meta_data = {}
+          for i, k in ipairs(KEYS) do
+            local best = tonumber(redis.call("ZRANGE", k, 0, 0, "WITHSCORES")[2])
+            local count = tonumber(redis.call("ZCARD", k))
+            meta_data[i] = {best, count}
+          end
+          return meta_data
+        LUA
+        groups.each.with_index do |(_, hash), index|
+          best, count = meta_data[index]
+          hash[:best_score] = best
+          hash[:snapshots_count] = count
+        end
+        groups
+      end
+
+      def fetch_snapshots_group(group_name)
+        group_hash_key = group_snapshot_hash_key(group_name)
+        snapshots = []
+        corrupt_snapshots = []
+        redis.hmgetall(group_hash_key).each do |id, bytes|
+          snapshots << Marshal.load(bytes)
+        rescue
+          corrupt_snapshots << id
+        end
+        if corrupt_snapshots.size > 0
+          redis.eval(<<~LUA)
+            
+          LUA
+        end
       end
 
       def fetch_snapshots(batch_size: 200, &blk)
@@ -281,10 +318,6 @@ unviewed_ids: #{get_unviewed_ids(user)}
 
       def group_snapshot_hash_key(group_name)
         @group_snapshot_hash_key ||= "#{@prefix}-mp-group-snapshot-hash-key-#{group_name}"
-      end
-
-      def group_snapshot_best_score_key(group_name)
-        @group_snapshot_best_score_key ||= "#{@prefix}-mp-group-snapshot-best-score-#{group_name}"
       end
 
       def snapshot_overview_zset_key
