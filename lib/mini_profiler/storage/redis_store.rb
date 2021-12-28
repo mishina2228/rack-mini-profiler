@@ -131,35 +131,71 @@ unviewed_ids: #{get_unviewed_ids(user)}
         )
       end
 
-      def push_snapshot(page_struct, config)
-        zset_key = snapshot_zset_key()
-        hash_key = snapshot_hash_key()
+      def push_snapshot(page_struct, group_name, config)
+        group_zset_key = group_snapshot_zset_key(group_name)
+        group_hash_key = group_snapshot_hash_key(group_name)
+        overview_zset_key = snapshot_overview_zset_key
 
         id = page_struct[:id]
-        score = page_struct.duration_ms
-        limit = config.snapshots_limit
+        score = page_struct.duration_ms.to_s
+
+        per_group_limit = config.max_snapshots_per_group.to_s
+        groups_limit = config.max_snapshot_groups.to_s
         bytes = Marshal.dump(page_struct)
 
         lua = <<~LUA
-          local zset_key = KEYS[1]
-          local hash_key = KEYS[2]
+          local group_zset_key = KEYS[1]
+          local group_hash_key = KEYS[2]
+          local overview_zset_key = KEYS[3]
+
           local id = ARGV[1]
           local score = tonumber(ARGV[2])
-          local bytes = ARGV[3]
-          local limit = tonumber(ARGV[4])
-          redis.call("ZADD", zset_key, score, id)
-          redis.call("HSET", hash_key, id, bytes)
-          if redis.call("ZCARD", zset_key) > limit then
-            local lowest_snapshot_id = redis.call("ZRANGE", zset_key, 0, 0)[1]
-            redis.call("ZREM", zset_key, lowest_snapshot_id)
-            redis.call("HDEL", hash_key, lowest_snapshot_id)
+          local group_name = ARGV[3]
+          local per_group_limit = tonumber(ARGV[4])
+          local groups_limit = tonumber(ARGV[5])
+          local prefix = ARGV[6]
+          local bytes = ARGV[7]
+
+          local current_group_score = redis.call("ZSCORE", overview_zset_key, group_name)
+          if current_group_score == false or score > tonumber(current_group_score) then
+            redis.call("ZADD", overview_zset_key, score, group_name)
+          end
+
+          local do_save = true
+          if redis.call("ZCARD", overview_zset_key) > groups_limit then
+            local lowest_group = redis.call("ZRANGE", overview_zset_key, 0, 0)[1]
+            redis.call("ZREM", overview_zset_key, lowest_group)
+            do_save = lowest_group ~= group_name
+            if do_save then
+              local lowest_group_zset_key = prefix .. "-mp-group-snapshot-zset-key-" .. lowest_group
+              local lowest_group_hash_key = prefix .. "-mp-group-snapshot-hash-key-" .. lowest_group
+              redis.call("DEL", lowest_group_zset_key, lowest_group_hash_key)
+            end
+          end
+
+          if do_save then
+            redis.call("ZADD", group_zset_key, score, id)
+            if redis.call("ZCARD", group_zset_key) > per_group_limit then
+              local lowest_snapshot_id = redis.call("ZRANGE", group_zset_key, 0, 0)[1]
+              redis.call("ZREM", group_zset_key, lowest_snapshot_id)
+              do_save = lowest_snapshot_id ~= id
+              if do_save then
+                redis.call("HDEL", group_hash_key, lowest_snapshot_id)
+              end
+            end
+            if do_save then
+              redis.call("HSET", group_hash_key, id, bytes)
+            end
           end
         LUA
         redis.eval(
           lua,
-          keys: [zset_key, hash_key],
-          argv: [id, score, bytes, limit]
+          keys: [group_zset_key, group_hash_key, overview_zset_key],
+          argv: [id, score, group_name, per_group_limit, groups_limit, @prefix, bytes]
         )
+      end
+
+      def fetch_snapshots_overview
       end
 
       def fetch_snapshots(batch_size: 200, &blk)
@@ -237,6 +273,22 @@ unviewed_ids: #{get_unviewed_ids(user)}
 
       def snapshot_hash_key
         @snapshot_hash_key ||= "#{@prefix}-mini-profiler-snapshots-hash"
+      end
+
+      def group_snapshot_zset_key(group_name)
+        @group_snapshot_zset_key ||= "#{@prefix}-mp-group-snapshot-zset-key-#{group_name}"
+      end
+
+      def group_snapshot_hash_key(group_name)
+        @group_snapshot_hash_key ||= "#{@prefix}-mp-group-snapshot-hash-key-#{group_name}"
+      end
+
+      def group_snapshot_best_score_key(group_name)
+        @group_snapshot_best_score_key ||= "#{@prefix}-mp-group-snapshot-best-score-#{group_name}"
+      end
+
+      def snapshot_overview_zset_key
+        @snapshot_overview_zset_key ||= "#{@prefix}-mp-overviewgroup-snapshot-zset-key"
       end
 
       def cached_redis_eval(script, script_sha, reraise: true, argv: [], keys: [])
