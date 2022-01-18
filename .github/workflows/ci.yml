@@ -3,8 +3,6 @@ name: Mini Profiler Tests
 on:
   pull_request:
   push:
-    branches:
-      - master
 
 env:
   MEMCACHE_SERVERS: localhost:11211
