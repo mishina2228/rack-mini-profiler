@@ -179,7 +179,7 @@ task :speedscope_upgrade do
         puts "ERROR: Expected a 200 status code from download URL but instead got #{res.code.inspect}."
         exit
       end
-      open(temp_zip_file, 'w') do |io|
+      File.open(temp_zip_file, 'w') do |io|
         response.read_body do |chunk|
           io.write(chunk)
         end
